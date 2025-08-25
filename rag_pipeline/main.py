@@ -6,13 +6,11 @@ import time
 from typing import List, Dict, Any
 
 from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import CharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
-# MODIFIED: We import the building blocks for a more robust, custom chain
-from langchain.chains.llm import LLMChain
-from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.prompts import PromptTemplate
 
 from config import (
@@ -21,26 +19,45 @@ from config import (
     MAX_SEARCH_RESULTS, SEARCH_RETRY_ATTEMPTS
 )
 
+def _refine_search_query(query: str) -> str:
+    """
+    Refines a user query into a more effective search query for an academic database
+    using a fast, rule-based approach.
+    """
+    # Keywords that encourage definitional and explanatory results
+    definitional_keywords = [
+        "definition", "explanation", "key concepts", "introduction to",
+        "principles of", "overview of", "what is"
+    ]
+    # Check if the query already seems detailed or definitional
+    if not any(keyword in query.lower() for keyword in definitional_keywords):
+        refined_query = f"explanation and key concepts of {query}"
+        print(f"Refined search query: {refined_query}")
+        return refined_query
+    return query # Return original query if it's already good
+
 def search_semantic_scholar(query: str, api_key: str) -> List[Dict[str, Any]]:
     """Searches Semantic Scholar for academic papers with retry logic."""
     params = {"query": query, "limit": MAX_SEARCH_RESULTS, "fields": "title,abstract,url"}
     headers = {"x-api-key": api_key}
-    
     for attempt in range(SEARCH_RETRY_ATTEMPTS):
         try:
             response = requests.get(SEMANTIC_SCHOLAR_API_URL, params=params, headers=headers, timeout=10)
             response.raise_for_status()
             data = response.json().get("data", [])
             return [{"title": p.get("title", "No title"), "abstract": p.get("abstract") or "No abstract available.", "url": p.get("url", "No URL")} for p in data]
-        except Exception as e:
-            print(f"Error fetching from Semantic Scholar on attempt {attempt + 1}: {e}")
+        except Exception:
             time.sleep(2)
     return []
 
 def build_vector_store(papers: List[Dict[str, Any]]) -> Chroma:
-    """Builds a Chroma vector store from paper abstracts."""
+    """Builds a Chroma vector store using a smarter text splitter."""
     docs = []
-    splitter = CharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", ", ", " "]
+    )
     
     for paper in papers:
         if paper['abstract'] and paper['abstract'] != "No abstract available.":
@@ -49,36 +66,52 @@ def build_vector_store(papers: List[Dict[str, Any]]) -> Chroma:
                 docs.append(Document(page_content=chunk, metadata={"source": paper['url']}))
 
     if not docs:
-        raise ValueError("No valid abstracts found in the search results to build a knowledge base.")
+        raise ValueError("No valid abstracts found in search results to build a knowledge base.")
 
     embedder = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
     db = Chroma.from_documents(docs, embedding=embedder)
     return db
 
-def process_query(query: str, api_key: str) -> Dict[str, str]:
-    """
-    The main function to process a user query using a custom-prompt RAG pipeline.
-    """
-    if not os.getenv("GOOGLE_API_KEY"):
-        return {"answer": "Error: GOOGLE_API_KEY not found in environment variables.", "sources": ""}
+def process_query(query: str, api_key: str) -> Dict[str, Any]:
+    """The main RAG pipeline, now with efficient query refinement."""
+    start_time = time.time()
+    metrics = {"sources_found": 0, "docs_retrieved": 0, "is_error": False}
 
-    papers = search_semantic_scholar(query, api_key)
+    if not os.getenv("GOOGLE_API_KEY"):
+        metrics["is_error"] = True
+        return {"answer": "Error: GOOGLE_API_KEY is not configured.", "sources": "", "metrics": metrics}
+    
+    # Use the cost-effective and efficient Flash model
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=LLM_TEMPERATURE)
+
+    # Step 1: Efficiently refine the search query
+    refined_query = _refine_search_query(query)
+    
+    # Step 2: Search with the better query
+    papers = search_semantic_scholar(refined_query, api_key)
+    metrics["sources_found"] = len(papers)
+
     if not papers:
-        return {"answer": "I could not find any relevant academic papers for your query. Please try a different query.", "sources": ""}
+        return {"answer": "I could not find any relevant academic papers for this query.", "sources": "", "metrics": metrics}
     
     try:
-        # 1. Build the knowledge base and retrieve relevant documents
         vector_db = build_vector_store(papers)
         retriever = vector_db.as_retriever(search_kwargs={"k": VECTOR_DB_SEARCH_NEIGHBORS})
+        # Use the original user query for retrieval for maximum relevance
         retrieved_docs = retriever.invoke(query)
+        metrics["docs_retrieved"] = len(retrieved_docs)
 
         if not retrieved_docs:
-             return {"answer": "Could not find a specific answer in the retrieved papers. Please try rephrasing your query.", "sources": ""}
+            return {"answer": "Could not find a specific answer in the retrieved papers.", "sources": "", "metrics": metrics}
 
-        # 2. Engineer a clear and explicit prompt for the LLM
         prompt_template = """
-        You are a helpful research assistant. Answer the user's question based ONLY on the following sources.
-        Do not use any other information. If the answer is not found in the sources, say "I could not find a definitive answer in the provided sources."
+        You are an expert research assistant and an excellent tutor. Your goal is to provide a clear, insightful, and helpful answer to the user's question.
+        Your answer must be based **exclusively** on the following sources. Do not use any other knowledge.
+        Follow these instructions precisely:
+        1.  Begin your response with a direct and clear definition of the main topic.
+        2.  After the definition, synthesize the key concepts, methodologies, and applications mentioned across all the provided sources.
+        3.  Organize your answer logically. Use paragraphs to separate different ideas.
+        4.  If the sources do not contain enough information to answer the question, you must state: "I could not find a definitive answer in the provided sources."
 
         SOURCES:
         {context}
@@ -86,28 +119,23 @@ def process_query(query: str, api_key: str) -> Dict[str, str]:
         QUESTION:
         {question}
 
-        YOUR ANSWER:
+        YOUR HELPFUL AND DETAILED ANSWER:
         """
         prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-
-        # 3. Define the LLM and the custom chain
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=LLM_TEMPERATURE)
-        llm_chain = LLMChain(llm=llm, prompt=prompt)
         
-        # This chain takes our documents, stuffs them into the 'context' variable of the prompt, and runs the LLMChain
-        stuff_chain = StuffDocumentsChain(llm_chain=llm_chain, document_variable_name="context")
+        combine_docs_chain = create_stuff_documents_chain(llm, prompt)
+        response = combine_docs_chain.invoke({"context": retrieved_docs, "question": query})
         
-        # 4. Run the chain and get the response
-        response = stuff_chain.invoke({"input_documents": retrieved_docs, "question": query})
-        
-        # 5. Manually collect the sources to guarantee they are correct
         sources = set(doc.metadata['source'] for doc in retrieved_docs)
+        metrics["response_time_ms"] = int((time.time() - start_time) * 1000)
         
         return {
-            "answer": response.get('output_text', 'No answer was generated by the model.'),
-            "sources": "\n".join(sources)
+            "answer": response,
+            "sources": "\n".join(sources),
+            "metrics": metrics
         }
         
     except Exception as e:
-        print(f"An error occurred during the RAG process: {e}")
-        return {"answer": f"An error occurred while processing your request. Details: {e}", "sources": ""}
+        metrics["is_error"] = True
+        metrics["response_time_ms"] = int((time.time() - start_time) * 1000)
+        return {"answer": f"An error occurred: {e}", "sources": "", "metrics": metrics}
